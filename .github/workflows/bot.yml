@@ -50,6 +50,8 @@ jobs:
 
           echo $! > api.pid
 
+          echo "Waiting for Local Bot API..."
+
           for i in {1..60}; do
             if curl -fsS \
               "http://127.0.0.1:$API_PORT/" \
@@ -59,6 +61,7 @@ jobs:
             fi
 
             if [ "$i" = "60" ]; then
+              echo "Local Bot API failed to start."
               cat api.log
               exit 1
             fi
@@ -81,8 +84,7 @@ jobs:
       - name: Run Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: |
-          python bot.py
+        run: python bot.py
 
       - name: Cleanup
         if: always()
