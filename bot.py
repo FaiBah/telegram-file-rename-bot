@@ -86,14 +86,38 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    user_id = update.effective_user.id
-
     await update.message.reply_text(
         "🤖 Telegram File Rename Bot\n\n"
-        "Send or forward documents.\n"
+        "Send or forward documents and I'll rename them "
+        "and send the renamed files back.\n\n"
         "Each user has an independent queue.\n\n"
-        "/cancel - Cancel your current file and queue\n"
+        "/help - Show help\n"
+        "/cancel - Cancel your queue\n"
         "/stop - Stop bot"
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        "🤖 Telegram File Rename Bot\n\n"
+        "📁 Send or forward a document.\n"
+        "✏️ Enter the new filename when asked.\n"
+        "📤 The renamed file will be sent back to you.\n\n"
+        "Commands:\n"
+        "/start - Start bot\n"
+        "/help - Show help\n"
+        "/cancel - Cancel your current queue\n"
+        "/stop - Stop bot\n\n"
+        "📦 Multiple files are supported.\n"
+        "👥 Each user has an independent queue.\n"
+        "🔀 Multiple users can use the bot at the same time.\n\n"
+        "Example:\n"
+        "📎 old_file.zip\n"
+        "✏️ Enter: new_file.zip\n"
+        "📤 Bot sends: new_file.zip"
     )
 
 
@@ -157,7 +181,6 @@ async def receive_document(
     )
 
     queue.files.append(item)
-
     queue.total += 1
 
     position = (
@@ -209,9 +232,10 @@ async def queue_worker(
                 "✏️ Enter new filename:"
             )
 
-            # Wait until the filename handler supplies
-            # a filename for this exact queue item.
-            while queue.waiting_filename and not queue.cancelled:
+            while (
+                queue.waiting_filename
+                and not queue.cancelled
+            ):
                 await asyncio.sleep(0.2)
 
             if queue.cancelled:
@@ -261,9 +285,6 @@ async def queue_worker(
                 queues.pop(user_id, None)
                 return
 
-            # Keep the file in the queue after failure.
-            queue.waiting_filename = True
-
             await update.message.reply_text(
                 "⚠️ File was not completed.\n"
                 "You can enter the filename again to retry."
@@ -280,8 +301,7 @@ async def queue_worker(
 
         try:
             await update.message.reply_text(
-                "❌ Queue worker stopped unexpectedly.\n\n"
-                f"{error}"
+                "❌ Queue worker stopped unexpectedly."
             )
         except Exception:
             pass
@@ -328,12 +348,9 @@ async def download_file(
                 f"{attempt}/{MAX_RETRIES - 1}"
             )
 
-            try:
-                temp_path.unlink(
-                    missing_ok=True
-                )
-            except Exception:
-                pass
+            temp_path.unlink(
+                missing_ok=True
+            )
 
             await asyncio.sleep(
                 3 * attempt
@@ -456,12 +473,9 @@ async def process_file(
         raise
 
     finally:
-        try:
-            temp_path.unlink(
-                missing_ok=True
-            )
-        except Exception:
-            pass
+        temp_path.unlink(
+            missing_ok=True
+        )
 
 
 async def receive_filename(
@@ -493,7 +507,6 @@ async def receive_filename(
         )
         return
 
-    # Store the filename for the worker.
     queue.next_filename = filename
     queue.waiting_filename = False
 
@@ -522,24 +535,19 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
+        CommandHandler("start", start)
     )
 
     app.add_handler(
-        CommandHandler(
-            "cancel",
-            cancel,
-        )
+        CommandHandler("help", help_command)
     )
 
     app.add_handler(
-        CommandHandler(
-            "stop",
-            stop,
-        )
+        CommandHandler("cancel", cancel)
+    )
+
+    app.add_handler(
+        CommandHandler("stop", stop)
     )
 
     app.add_handler(
@@ -559,21 +567,6 @@ def main():
     app.add_error_handler(
         error_handler
     )
-
-    print("----------------------------------------")
-    print("🤖 Telegram File Rename Bot")
-    print("----------------------------------------")
-    print("📁 Documents only")
-    print("📦 Per-user queues")
-    print("👥 Multiple users concurrently")
-    print("🔀 Unique temporary filenames")
-    print("📦 Local Bot API")
-    print("🔁 Download/upload retries: 3")
-    print("⏱️ Transfer timeout: 1 hour")
-    print("📝 Exact user filename")
-    print("🛑 Force /cancel")
-    print("🟢 Running")
-    print("----------------------------------------")
 
     app.run_polling()
 
