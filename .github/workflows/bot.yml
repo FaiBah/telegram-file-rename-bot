@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download Local Bot API
+      - name: Download latest Local Bot API
         run: |
           set -e
 
@@ -25,22 +25,28 @@ jobs:
             "https://api.github.com/repos/$API_REPO/releases/latest" \
             | python -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
 
+          echo "Latest API version: $VERSION"
+
           ASSET="telegram-bot-api-linux-x64-${VERSION}.tar.gz"
+
+          echo "Downloading: $ASSET"
 
           curl -fL \
             -o telegram-bot-api.tar.gz \
             "https://github.com/$API_REPO/releases/download/${VERSION}/${ASSET}"
 
-          tar -xzf telegram-bot-api.tar.gz -C api
+          tar -xzf telegram-bot-api.tar.gz \
+            -C api
+
           chmod +x api/bin/telegram-bot-api
+
+          echo "Installed Telegram Bot API $VERSION"
 
       - name: Start Local Bot API
         env:
           API_ID: ${{ secrets.TELEGRAM_API_ID }}
           API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: |
-          set -e
-
           api/bin/telegram-bot-api \
             --api-id="$API_ID" \
             --api-hash="$API_HASH" \
@@ -52,22 +58,27 @@ jobs:
 
           echo "Waiting for Local Bot API..."
 
-          for i in {1..60}; do
-            if curl -fsS \
+          READY=false
+
+          for i in {1..30}; do
+            if curl -s \
               "http://127.0.0.1:$API_PORT/" \
               >/dev/null 2>&1; then
-              echo "Local Bot API ready."
-              break
-            fi
 
-            if [ "$i" = "60" ]; then
-              echo "Local Bot API failed to start."
-              cat api.log
-              exit 1
+              echo "Local Bot API ready."
+              READY=true
+              break
             fi
 
             sleep 2
           done
+
+          if [ "$READY" != "true" ]; then
+            echo "Local Bot API failed to start."
+            echo "----- api.log -----"
+            cat api.log
+            exit 1
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -76,12 +87,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install Bot
+      - name: Install bot
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Bot
+      - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: python bot.py
