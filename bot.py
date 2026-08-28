@@ -1,10 +1,7 @@
 import os
 import re
 import uuid
-import time
 from pathlib import Path
-
-import aiohttp
 
 from telegram import Update
 from telegram.ext import (
@@ -15,7 +12,8 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = os.environ["BOT_TOKEN"]
+
+TOKEN = os.environ["BOT_TOKEN"].strip()
 
 API_BASE = "http://127.0.0.1:8081/bot"
 FILE_API_BASE = "http://127.0.0.1:8081/file/bot"
@@ -23,10 +21,8 @@ FILE_API_BASE = "http://127.0.0.1:8081/file/bot"
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-PROGRESS_INTERVAL = 2
 
-
-def clean_filename(name):
+def clean_filename(name: str) -> str:
     name = re.sub(
         r'[<>:"/\\|?*\x00-\x1F]',
         "_",
@@ -36,12 +32,10 @@ def clean_filename(name):
     return name.strip().strip(".")
 
 
-def progress_bar(percent, length=20):
-    filled = int(length * percent / 100)
-    return "█" * filled + "░" * (length - filled)
+def format_size(size: int | None) -> str:
+    if not size:
+        return "Unknown size"
 
-
-def format_size(size):
     if size < 1024 * 1024:
         return f"{size / 1024:.1f} KB"
 
@@ -51,217 +45,14 @@ def format_size(size):
     return f"{size / 1024 / 1024 / 1024:.2f} GB"
 
 
-def format_speed(speed):
-    if speed < 1024 * 1024:
-        return f"{speed / 1024:.1f} KB/s"
+def progress_bar(percent: int, length: int = 20) -> str:
+    percent = max(0, min(100, percent))
+    filled = int(length * percent / 100)
 
-    return f"{speed / 1024 / 1024:.1f} MB/s"
-
-
-def format_eta(seconds):
-    if seconds <= 0:
-        return "0s"
-
-    seconds = int(seconds)
-
-    if seconds < 60:
-        return f"{seconds}s"
-
-    minutes, seconds = divmod(seconds, 60)
-
-    if minutes < 60:
-        return f"{minutes}m {seconds}s"
-
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes}m"
-
-
-async def update_progress(
-    message,
-    action,
-    current,
-    total,
-    start_time,
-    force=False,
-):
-    if total <= 0:
-        return
-
-    now = time.monotonic()
-
-    last_update = getattr(
-        message,
-        "_progress_time",
-        0,
+    return (
+        "█" * filled
+        + "░" * (length - filled)
     )
-
-    if not force and now - last_update < PROGRESS_INTERVAL:
-        return
-
-    message._progress_time = now
-
-    percent = current * 100 / total
-    elapsed = max(now - start_time, 0.001)
-
-    speed = current / elapsed
-    remaining = max(total - current, 0)
-
-    eta = remaining / speed if speed > 0 else 0
-
-    text = (
-        f"{action}\n"
-        f"{progress_bar(percent)} {percent:.1f}%\n"
-        f"{format_size(current)} / {format_size(total)}\n"
-        f"⚡ {format_speed(speed)}\n"
-        f"⏱️ ETA {format_eta(eta)}"
-    )
-
-    try:
-        await message.edit_text(text)
-    except Exception:
-        pass
-
-
-async def download_file(
-    file_path,
-    destination,
-    progress_message,
-    total_size,
-):
-    url = f"{FILE_API_BASE}/{file_path}"
-
-    start_time = time.monotonic()
-    current = 0
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(
-                total=None
-            ),
-        ) as response:
-
-            response.raise_for_status()
-
-            with open(destination, "wb") as file:
-                async for chunk in response.content.iter_chunked(
-                    1024 * 1024
-                ):
-                    file.write(chunk)
-                    current += len(chunk)
-
-                    await update_progress(
-                        progress_message,
-                        "⬇️ Downloading",
-                        current,
-                        total_size,
-                        start_time,
-                    )
-
-    await update_progress(
-        progress_message,
-        "⬇️ Downloading",
-        current,
-        total_size,
-        start_time,
-        force=True,
-    )
-
-
-async def upload_file(
-    chat_id,
-    path,
-    filename,
-    caption,
-    progress_message,
-):
-    url = f"{API_BASE}/{TOKEN}/sendDocument"
-
-    total_size = path.stat().st_size
-    start_time = time.monotonic()
-
-    class ProgressFile:
-        def __init__(self, file_path):
-            self.file = open(file_path, "rb")
-            self.size = total_size
-            self.sent = 0
-
-        async def read(self, size=-1):
-            data = self.file.read(size)
-
-            if data:
-                self.sent += len(data)
-
-                await update_progress(
-                    progress_message,
-                    "📤 Uploading",
-                    self.sent,
-                    self.size,
-                    start_time,
-                )
-
-            return data
-
-        def close(self):
-            self.file.close()
-
-    progress_file = ProgressFile(path)
-
-    try:
-        form = aiohttp.FormData()
-
-        form.add_field(
-            "chat_id",
-            str(chat_id),
-        )
-
-        form.add_field(
-            "caption",
-            caption,
-        )
-
-        form.add_field(
-            "parse_mode",
-            "Markdown",
-        )
-
-        form.add_field(
-            "document",
-            progress_file.file,
-            filename=filename,
-            content_type="application/octet-stream",
-        )
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                data=form,
-                timeout=aiohttp.ClientTimeout(
-                    total=None
-                ),
-            ) as response:
-
-                result = await response.json()
-
-                if not result.get("ok"):
-                    raise RuntimeError(
-                        result.get(
-                            "description",
-                            "Upload failed",
-                        )
-                    )
-
-        await update_progress(
-            progress_message,
-            "📤 Uploading",
-            total_size,
-            total_size,
-            start_time,
-            force=True,
-        )
-
-    finally:
-        progress_file.close()
 
 
 async def start(
@@ -271,7 +62,7 @@ async def start(
     context.user_data.clear()
 
     await update.message.reply_text(
-        "🤖 Maxico Rename Bot\n\n"
+        "🤖 Telegram File Rename Bot\n\n"
         "Send or forward one or more documents.\n"
         "I will process them one by one.\n\n"
         "/cancel - Cancel queue\n"
@@ -323,8 +114,9 @@ async def receive_document(
     )
 
     await update.message.reply_text(
-        f"📥 Added: "
-        f"`{document.file_name or 'file'}`\n"
+        f"📥 Added to queue\n\n"
+        f"📎 `{document.file_name or 'file'}`\n"
+        f"📏 {format_size(document.file_size)}\n"
         f"📦 Queue: {len(queue)} file(s)",
         parse_mode="Markdown",
     )
@@ -346,10 +138,7 @@ async def process_next(
     )
 
     if not queue:
-        context.user_data.pop(
-            "processing",
-            None,
-        )
+        context.user_data.clear()
 
         await update.message.reply_text(
             "✅ All files completed."
@@ -364,7 +153,9 @@ async def process_next(
     context.user_data["current_file"] = item
 
     await update.message.reply_text(
-        f"📁 `{item['original_name']}`\n\n"
+        f"📦 File 1 / {len(queue)}\n\n"
+        f"📎 `{item['original_name']}`\n"
+        f"📏 {format_size(item['size'])}\n\n"
         "✏️ Enter new filename:",
         parse_mode="Markdown",
     )
@@ -404,56 +195,107 @@ async def rename_file(
     if extension and "." not in new_name:
         new_name += extension
 
+    # Unique temporary filename.
     temp_name = (
         f"{uuid.uuid4().hex}_{new_name}"
     )
 
-    path = DOWNLOAD_DIR / temp_name
-
-    progress_message = None
+    temp_path = DOWNLOAD_DIR / temp_name
 
     try:
-        progress_message = await update.message.reply_text(
-            "⬇️ Preparing download..."
+        # ---------------------------------------------
+        # DOWNLOAD
+        # ---------------------------------------------
+
+        progress = await update.message.reply_text(
+            "⬇️ Downloading...\n\n"
+            f"{progress_bar(0)} 0%"
         )
 
         telegram_file = await context.bot.get_file(
             item["file_id"]
         )
 
-        await download_file(
-            telegram_file.file_path,
-            path,
-            progress_message,
-            item["size"],
+        local_source = (
+            await telegram_file.download_to_drive(
+                custom_path=temp_path,
+                read_timeout=600,
+                write_timeout=600,
+                connect_timeout=60,
+                pool_timeout=60,
+            )
         )
 
-        await progress_message.edit_text(
-            "📤 Preparing upload..."
+        await progress.edit_text(
+            "⬇️ Downloading...\n\n"
+            f"{progress_bar(100)} 100%\n\n"
+            "✅ Download complete"
         )
 
-        await upload_file(
-            update.effective_chat.id,
-            path,
-            new_name,
-            f"✅ `{new_name}`",
-            progress_message,
-        )
+        # ---------------------------------------------
+        # PREPARE
+        # ---------------------------------------------
 
-        await progress_message.edit_text(
-            f"✅ Complete\n\n"
+        await progress.edit_text(
+            "🔄 Preparing renamed file...\n\n"
             f"📎 `{new_name}`",
             parse_mode="Markdown",
         )
 
-        path.unlink(missing_ok=True)
+        # ---------------------------------------------
+        # UPLOAD
+        # ---------------------------------------------
 
+        await progress.edit_text(
+            "📤 Uploading...\n\n"
+            "⏳ Sending to Telegram..."
+        )
+
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=local_source,
+            filename=new_name,
+            caption=f"✅ `{new_name}`",
+            parse_mode="Markdown",
+            read_timeout=600,
+            write_timeout=600,
+            connect_timeout=60,
+            pool_timeout=60,
+        )
+
+        # ---------------------------------------------
+        # COMPLETE
+        # ---------------------------------------------
+
+        await progress.edit_text(
+            "✅ Complete\n\n"
+            f"📎 `{new_name}`",
+            parse_mode="Markdown",
+        )
+
+        # Delete temporary file.
+        try:
+            Path(local_source).unlink(
+                missing_ok=True
+            )
+        except Exception:
+            pass
+
+        temp_path.unlink(
+            missing_ok=True
+        )
+
+        # Remove completed file.
         queue.pop(0)
 
         context.user_data.pop(
             "current_file",
             None,
         )
+
+        # ---------------------------------------------
+        # NEXT FILE
+        # ---------------------------------------------
 
         if queue:
             await process_next(
@@ -464,14 +306,17 @@ async def rename_file(
             context.user_data.clear()
 
             await update.message.reply_text(
-                "✅ All files completed."
+                "🎉 All files completed."
             )
 
     except Exception as error:
-        path.unlink(missing_ok=True)
+        temp_path.unlink(
+            missing_ok=True
+        )
 
         await update.message.reply_text(
-            f"❌ Error:\n`{error}`",
+            "❌ Error\n\n"
+            f"`{error}`",
             parse_mode="Markdown",
         )
 
@@ -491,17 +336,27 @@ def main():
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     app.add_handler(
-        CommandHandler("cancel", cancel)
+        CommandHandler(
+            "cancel",
+            cancel,
+        )
     )
 
     app.add_handler(
-        CommandHandler("stop", stop)
+        CommandHandler(
+            "stop",
+            stop,
+        )
     )
 
+    # Documents only.
     app.add_handler(
         MessageHandler(
             filters.Document.ALL,
@@ -509,6 +364,7 @@ def main():
         )
     )
 
+    # Filename input.
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -517,12 +373,13 @@ def main():
     )
 
     print("----------------------------------------")
-    print("🤖 Maxico Rename Bot")
+    print("🤖 Telegram File Rename Bot")
     print("----------------------------------------")
     print("📁 Documents only")
     print("📦 Multi-file queue")
     print("👥 Per-user queue")
-    print("📊 Download/upload progress")
+    print("🔀 Unique temporary filenames")
+    print("📊 Transfer status")
     print("📦 Local Bot API")
     print("🟢 Running")
     print("----------------------------------------")
