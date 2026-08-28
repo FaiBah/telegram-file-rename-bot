@@ -3,6 +3,7 @@ import re
 import uuid
 import asyncio
 from pathlib import Path
+from dataclasses import dataclass, field
 
 from telegram import Update
 from telegram.ext import (
@@ -12,6 +13,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import TimedOut, NetworkError
 
 
 TOKEN = os.environ["BOT_TOKEN"].strip()
@@ -27,13 +29,40 @@ WRITE_TIMEOUT = 3600
 CONNECT_TIMEOUT = 120
 POOL_TIMEOUT = 120
 
+MAX_RETRIES = 3
 
-def clean_filename(name):
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+
+@dataclass
+class FileItem:
+    file_id: str
+    original_name: str
+    size: int
+
+
+@dataclass
+class UserQueue:
+    files: list[FileItem] = field(default_factory=list)
+    worker: asyncio.Task | None = None
+    waiting_filename: bool = False
+    cancelled: bool = False
+    position: int = 1
+    total: int = 0
+
+
+queues: dict[int, UserQueue] = {}
+
+
+def clean_filename(name: str) -> str:
+    name = re.sub(
+        r'[<>:"/\\|?*\x00-\x1F]',
+        "_",
+        name,
+    )
+
     return name.strip().strip(".")
 
 
-def format_size(size):
+def format_size(size: int | None) -> str:
     if not size:
         return "Unknown size"
 
@@ -46,40 +75,65 @@ def format_size(size):
     return f"{size / 1024 / 1024 / 1024:.2f} GB"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+def get_queue(user_id: int) -> UserQueue:
+    if user_id not in queues:
+        queues[user_id] = UserQueue()
+
+    return queues[user_id]
+
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_id = update.effective_user.id
 
     await update.message.reply_text(
         "🤖 Telegram File Rename Bot\n\n"
         "Send or forward documents.\n"
-        "Files are processed one by one.\n\n"
-        "/cancel - Force cancel current file + queue\n"
+        "Each user has an independent queue.\n\n"
+        "/cancel - Cancel your current file and queue\n"
         "/stop - Stop bot"
     )
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    task = context.user_data.get("processing_task")
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user_id = update.effective_user.id
+    queue = queues.get(user_id)
 
-    context.user_data["cancelled"] = True
-    context.user_data["queue"] = []
-    context.user_data["waiting_name"] = False
+    if not queue:
+        await update.message.reply_text(
+            "❌ Your queue is empty."
+        )
+        return
 
-    if task and not task.done():
-        task.cancel()
+    queue.cancelled = True
+    queue.files.clear()
+    queue.waiting_filename = False
+
+    worker = queue.worker
+
+    if worker and not worker.done():
+        worker.cancel()
 
         await update.message.reply_text(
-            "🛑 Cancelling current transfer..."
+            "🛑 Cancelling your current transfer and queue..."
         )
     else:
-        context.user_data.clear()
+        queues.pop(user_id, None)
 
         await update.message.reply_text(
-            "❌ Queue cancelled."
+            "❌ Your queue has been cancelled."
         )
 
 
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     await update.message.reply_text(
         "🛑 Stopping bot..."
     )
@@ -91,120 +145,301 @@ async def receive_document(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    user_id = update.effective_user.id
     document = update.message.document
 
-    queue = context.user_data.setdefault(
-        "queue",
-        [],
+    queue = get_queue(user_id)
+
+    item = FileItem(
+        file_id=document.file_id,
+        original_name=document.file_name or "file",
+        size=document.file_size or 0,
     )
 
-    queue.append({
-        "file_id": document.file_id,
-        "original_name": document.file_name or "file",
-        "size": document.file_size or 0,
-    })
+    queue.files.append(item)
 
-    if "total" not in context.user_data:
-        context.user_data["total"] = len(queue)
+    queue.total += 1
+
+    position = (
+        queue.position
+        + len(queue.files)
+        - 1
+    )
 
     await update.message.reply_text(
         "📥 Added to queue\n\n"
-        f"📎 {document.file_name or 'file'}\n"
-        f"📏 {format_size(document.file_size)}\n"
-        f"📦 Queue: {len(queue)} file(s)"
+        f"📎 {item.original_name}\n"
+        f"📏 {format_size(item.size)}\n"
+        f"📦 Queue position: {position}"
     )
 
-    if not context.user_data.get("processing_task"):
-        await ask_filename(update, context)
+    if queue.worker is None or queue.worker.done():
+        queue.worker = asyncio.create_task(
+            queue_worker(
+                update,
+                context,
+                user_id,
+            )
+        )
 
 
-async def ask_filename(
+async def queue_worker(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
 ):
-    queue = context.user_data.get("queue", [])
+    queue = queues.get(user_id)
 
     if not queue:
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "🎉 All files completed."
-        )
         return
 
-    context.user_data["waiting_name"] = True
+    try:
+        while queue.files and not queue.cancelled:
+            item = queue.files[0]
 
-    position = context.user_data.get(
-        "position",
+            queue.waiting_filename = True
+
+            current_number = queue.position
+            total = queue.total
+
+            await update.message.reply_text(
+                f"📦 File {current_number} / {total}\n\n"
+                f"📎 {item.original_name}\n"
+                f"📏 {format_size(item.size)}\n\n"
+                "✏️ Enter new filename:"
+            )
+
+            # Wait until the filename handler supplies
+            # a filename for this exact queue item.
+            while queue.waiting_filename and not queue.cancelled:
+                await asyncio.sleep(0.2)
+
+            if queue.cancelled:
+                break
+
+            filename = getattr(
+                queue,
+                "next_filename",
+                None,
+            )
+
+            if not filename:
+                continue
+
+            queue.next_filename = None
+
+            temp_path = (
+                DOWNLOAD_DIR
+                / f"{uuid.uuid4().hex}_{filename}"
+            )
+
+            success = await process_file(
+                update,
+                context,
+                item,
+                filename,
+                temp_path,
+                queue,
+            )
+
+            if queue.cancelled:
+                break
+
+            if success:
+                if queue.files:
+                    queue.files.pop(0)
+
+                queue.position += 1
+
+                if queue.files:
+                    continue
+
+                await update.message.reply_text(
+                    "🎉 All files completed."
+                )
+
+                queues.pop(user_id, None)
+                return
+
+            # Keep the file in the queue after failure.
+            queue.waiting_filename = True
+
+            await update.message.reply_text(
+                "⚠️ File was not completed.\n"
+                "You can enter the filename again to retry."
+            )
+
+    except asyncio.CancelledError:
+        pass
+
+    except Exception as error:
+        print(
+            f"Queue worker error for user {user_id}: "
+            f"{error!r}"
+        )
+
+        try:
+            await update.message.reply_text(
+                "❌ Queue worker stopped unexpectedly.\n\n"
+                f"{error}"
+            )
+        except Exception:
+            pass
+
+    finally:
+        queue = queues.get(user_id)
+
+        if queue and queue.cancelled:
+            queues.pop(user_id, None)
+
+
+async def download_file(
+    context,
+    file_id: str,
+    temp_path: Path,
+):
+    telegram_file = await context.bot.get_file(
+        file_id,
+        read_timeout=READ_TIMEOUT,
+        write_timeout=WRITE_TIMEOUT,
+        connect_timeout=CONNECT_TIMEOUT,
+        pool_timeout=POOL_TIMEOUT,
+    )
+
+    for attempt in range(
         1,
-    )
+        MAX_RETRIES + 1,
+    ):
+        try:
+            return await telegram_file.download_to_drive(
+                custom_path=temp_path,
+                read_timeout=READ_TIMEOUT,
+                write_timeout=WRITE_TIMEOUT,
+                connect_timeout=CONNECT_TIMEOUT,
+                pool_timeout=POOL_TIMEOUT,
+            )
 
-    total = context.user_data.get(
-        "total",
-        len(queue),
-    )
+        except (TimedOut, NetworkError):
+            if attempt >= MAX_RETRIES:
+                raise
 
-    item = queue[0]
+            print(
+                f"Download retry "
+                f"{attempt}/{MAX_RETRIES - 1}"
+            )
 
-    await update.message.reply_text(
-        f"📦 File {position} / {total}\n\n"
-        f"📎 {item['original_name']}\n"
-        f"📏 {format_size(item['size'])}\n\n"
-        "✏️ Enter new filename:"
-    )
+            try:
+                temp_path.unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
+
+            await asyncio.sleep(
+                3 * attempt
+            )
+
+
+async def upload_file(
+    context,
+    chat_id: int,
+    temp_path: Path,
+    filename: str,
+):
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1,
+    ):
+        try:
+            return await context.bot.send_document(
+                chat_id=chat_id,
+                document=temp_path,
+                filename=filename,
+                caption=f"✅ {filename}",
+                read_timeout=READ_TIMEOUT,
+                write_timeout=WRITE_TIMEOUT,
+                connect_timeout=CONNECT_TIMEOUT,
+                pool_timeout=POOL_TIMEOUT,
+            )
+
+        except (TimedOut, NetworkError):
+            if attempt >= MAX_RETRIES:
+                raise
+
+            print(
+                f"Upload retry "
+                f"{attempt}/{MAX_RETRIES - 1}"
+            )
+
+            await asyncio.sleep(
+                3 * attempt
+            )
 
 
 async def process_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    item,
-    new_name,
-    temp_path,
+    item: FileItem,
+    filename: str,
+    temp_path: Path,
+    queue: UserQueue,
 ):
     status = None
 
     try:
         status = await update.message.reply_text(
             "⬇️ Downloading file...\n\n"
-            f"📎 {item['original_name']}\n"
-            f"📏 {format_size(item['size'])}"
+            f"📎 {item.original_name}\n"
+            f"📏 {format_size(item.size)}"
         )
 
-        telegram_file = await context.bot.get_file(
-            item["file_id"]
-        )
+        try:
+            local_file = await download_file(
+                context,
+                item.file_id,
+                temp_path,
+            )
 
-        local_source = await telegram_file.download_to_drive(
-            custom_path=temp_path,
-            read_timeout=READ_TIMEOUT,
-            write_timeout=WRITE_TIMEOUT,
-            connect_timeout=CONNECT_TIMEOUT,
-            pool_timeout=POOL_TIMEOUT,
-        )
+        except asyncio.CancelledError:
+            raise
 
-        if context.user_data.get("cancelled"):
+        except Exception as error:
+            await status.edit_text(
+                "❌ Download failed.\n\n"
+                f"{error}"
+            )
+            return False
+
+        if queue.cancelled:
             return False
 
         await status.edit_text(
             "📤 Uploading renamed file...\n\n"
-            f"📎 {new_name}\n"
-            f"📏 {format_size(item['size'])}"
+            f"📎 {filename}\n"
+            f"📏 {format_size(item.size)}"
         )
 
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=local_source,
-            filename=new_name,
-            caption=f"✅ {new_name}",
-            read_timeout=READ_TIMEOUT,
-            write_timeout=WRITE_TIMEOUT,
-            connect_timeout=CONNECT_TIMEOUT,
-            pool_timeout=POOL_TIMEOUT,
-        )
+        try:
+            await upload_file(
+                context,
+                update.effective_chat.id,
+                local_file,
+                filename,
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+            await status.edit_text(
+                "❌ Upload failed.\n\n"
+                f"{error}"
+            )
+            return False
 
         await status.edit_text(
             "✅ Complete\n\n"
-            f"📎 {new_name}"
+            f"📎 {filename}"
         )
 
         return True
@@ -220,17 +455,6 @@ async def process_file(
 
         raise
 
-    except Exception as error:
-        if context.user_data.get("cancelled"):
-            return False
-
-        await update.message.reply_text(
-            "❌ Error processing file.\n\n"
-            f"{error}"
-        )
-
-        return False
-
     finally:
         try:
             temp_path.unlink(
@@ -240,95 +464,48 @@ async def process_file(
             pass
 
 
-async def rename_file(
+async def receive_filename(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    queue = context.user_data.get("queue", [])
+    user_id = update.effective_user.id
+    queue = queues.get(user_id)
 
-    if not queue or not context.user_data.get(
-        "waiting_name"
-    ):
+    if not queue or not queue.files:
         await update.message.reply_text(
             "📁 Send or forward a document first."
         )
         return
 
-    new_name = clean_filename(
+    if not queue.waiting_filename:
+        await update.message.reply_text(
+            "⏳ Your file is currently being processed."
+        )
+        return
+
+    filename = clean_filename(
         update.message.text.strip()
     )
 
-    if not new_name:
+    if not filename:
         await update.message.reply_text(
             "❌ Invalid filename."
         )
         return
 
-    item = queue[0]
+    # Store the filename for the worker.
+    queue.next_filename = filename
+    queue.waiting_filename = False
 
-    temp_path = (
-        DOWNLOAD_DIR
-        / f"{uuid.uuid4().hex}_{new_name}"
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    print(
+        f"Unhandled bot error: "
+        f"{context.error!r}"
     )
-
-    context.user_data["waiting_name"] = False
-    context.user_data["cancelled"] = False
-
-    task = asyncio.create_task(
-        process_file(
-            update,
-            context,
-            item,
-            new_name,
-            temp_path,
-        )
-    )
-
-    context.user_data["processing_task"] = task
-
-    try:
-        success = await task
-
-    except asyncio.CancelledError:
-        success = False
-
-    finally:
-        context.user_data.pop(
-            "processing_task",
-            None,
-        )
-
-    if context.user_data.get("cancelled"):
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "❌ Current file and remaining queue cancelled."
-        )
-
-        return
-
-    if not success:
-        context.user_data["waiting_name"] = True
-        return
-
-    queue = context.user_data.get("queue", [])
-
-    if queue:
-        queue.pop(0)
-
-    context.user_data["position"] = (
-        context.user_data.get("position", 1) + 1
-    )
-
-    if queue:
-        await ask_filename(update, context)
-
-    else:
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "🎉 All files completed."
-        )
 
 
 def main():
@@ -337,19 +514,32 @@ def main():
         .token(TOKEN)
         .base_url(API_BASE)
         .base_file_url(FILE_API_BASE)
+        .read_timeout(READ_TIMEOUT)
+        .write_timeout(WRITE_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .pool_timeout(POOL_TIMEOUT)
         .build()
     )
 
     app.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start,
+        )
     )
 
     app.add_handler(
-        CommandHandler("cancel", cancel)
+        CommandHandler(
+            "cancel",
+            cancel,
+        )
     )
 
     app.add_handler(
-        CommandHandler("stop", stop)
+        CommandHandler(
+            "stop",
+            stop,
+        )
     )
 
     app.add_handler(
@@ -362,19 +552,24 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            rename_file,
+            receive_filename,
         )
+    )
+
+    app.add_error_handler(
+        error_handler
     )
 
     print("----------------------------------------")
     print("🤖 Telegram File Rename Bot")
     print("----------------------------------------")
     print("📁 Documents only")
-    print("📦 Multi-file queue")
-    print("👥 Per-user queue")
+    print("📦 Per-user queues")
+    print("👥 Multiple users concurrently")
     print("🔀 Unique temporary filenames")
     print("📦 Local Bot API")
-    print("⏱️ 1-hour transfer timeout")
+    print("🔁 Download/upload retries: 3")
+    print("⏱️ Transfer timeout: 1 hour")
     print("📝 Exact user filename")
     print("🛑 Force /cancel")
     print("🟢 Running")
