@@ -1,4 +1,4 @@
-name: Maxico Rename Bot
+name: Telegram File Rename Bot
 
 on:
   workflow_dispatch:
@@ -9,49 +9,38 @@ jobs:
 
     env:
       API_PORT: 8081
+      API_REPO: FaiBah/telegram-bot-api-build
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Restore API cache
-        id: cache
-        uses: actions/cache@v4
-        with:
-          path: api
-          key: telegram-bot-api-ubuntu-v1
-
-      - name: Install build dependencies
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Download latest Local Bot API
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git \
-            g++ \
-            make \
-            cmake \
-            gperf \
-            zlib1g-dev \
-            libssl-dev
+          set -e
 
-      - name: Build Local Bot API
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --recursive \
-            https://github.com/tdlib/telegram-bot-api.git
+          mkdir -p api
 
-          cd telegram-bot-api
-          mkdir build
-          cd build
+          VERSION=$(curl -fsSL \
+            "https://api.github.com/repos/$API_REPO/releases/latest" \
+            | python -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
 
-          cmake \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$GITHUB_WORKSPACE/api" \
-            ..
+          echo "Latest API version: $VERSION"
 
-          cmake --build . \
-            --target install \
-            --parallel 2
+          ASSET="telegram-bot-api-linux-x64-${VERSION}.tar.gz"
+
+          echo "Downloading: $ASSET"
+
+          curl -fL \
+            -o telegram-bot-api.tar.gz \
+            "https://github.com/$API_REPO/releases/download/${VERSION}/${ASSET}"
+
+          tar -xzf telegram-bot-api.tar.gz \
+            -C api
+
+          chmod +x api/bin/telegram-bot-api
+
+          echo "Installed Telegram Bot API $VERSION"
 
       - name: Start Local Bot API
         env:
@@ -67,20 +56,28 @@ jobs:
 
           echo $! > api.pid
 
-          echo "Waiting for API..."
+          echo "Waiting for Local Bot API..."
+
+          READY=false
 
           for i in {1..30}; do
             if curl -s \
               "http://127.0.0.1:$API_PORT/" \
               >/dev/null 2>&1; then
-              echo "API ready"
+
+              echo "Local Bot API ready."
+              READY=true
               break
             fi
 
             sleep 2
           done
 
-          cat api.log || true
+          if [ "$READY" != "true" ]; then
+            echo "Local Bot API failed to start."
+            cat api.log
+            exit 1
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -106,3 +103,4 @@ jobs:
           fi
 
           rm -rf downloads
+          rm -f telegram-bot-api.tar.gz
