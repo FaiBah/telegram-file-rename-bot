@@ -33,14 +33,6 @@ def clean_filename(name):
     return name.strip().strip(".")
 
 
-def escape_md(text):
-    return re.sub(
-        r"([_*\[\]()~`>#+\-=|{}.!])",
-        r"\\\1",
-        str(text),
-    )
-
-
 def format_size(size):
     if not size:
         return "Unknown size"
@@ -75,11 +67,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if task and not task.done():
         task.cancel()
+
         await update.message.reply_text(
             "🛑 Cancelling current transfer..."
         )
     else:
         context.user_data.clear()
+
         await update.message.reply_text(
             "❌ Queue cancelled."
         )
@@ -114,11 +108,10 @@ async def receive_document(
         context.user_data["total"] = len(queue)
 
     await update.message.reply_text(
-        f"📥 Added to queue\n\n"
-        f"📎 `{escape_md(document.file_name or 'file')}`\n"
+        "📥 Added to queue\n\n"
+        f"📎 {document.file_name or 'file'}\n"
         f"📏 {format_size(document.file_size)}\n"
-        f"📦 Queue: {len(queue)} file(s)",
-        parse_mode="MarkdownV2",
+        f"📦 Queue: {len(queue)} file(s)"
     )
 
     if not context.user_data.get("processing_task"):
@@ -141,17 +134,23 @@ async def ask_filename(
 
     context.user_data["waiting_name"] = True
 
-    position = context.user_data.get("position", 1)
-    total = context.user_data.get("total", len(queue))
+    position = context.user_data.get(
+        "position",
+        1,
+    )
+
+    total = context.user_data.get(
+        "total",
+        len(queue),
+    )
 
     item = queue[0]
 
     await update.message.reply_text(
         f"📦 File {position} / {total}\n\n"
-        f"📎 `{escape_md(item['original_name'])}`\n"
+        f"📎 {item['original_name']}\n"
         f"📏 {format_size(item['size'])}\n\n"
-        "✏️ Enter new filename:",
-        parse_mode="MarkdownV2",
+        "✏️ Enter new filename:"
     )
 
 
@@ -167,9 +166,8 @@ async def process_file(
     try:
         status = await update.message.reply_text(
             "⬇️ Downloading file...\n\n"
-            f"📎 `{escape_md(item['original_name'])}`\n"
-            f"📏 {format_size(item['size'])}",
-            parse_mode="MarkdownV2",
+            f"📎 {item['original_name']}\n"
+            f"📏 {format_size(item['size'])}"
         )
 
         telegram_file = await context.bot.get_file(
@@ -189,17 +187,15 @@ async def process_file(
 
         await status.edit_text(
             "📤 Uploading renamed file...\n\n"
-            f"📎 `{escape_md(new_name)}`\n"
-            f"📏 {format_size(item['size'])}",
-            parse_mode="MarkdownV2",
+            f"📎 {new_name}\n"
+            f"📏 {format_size(item['size'])}"
         )
 
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=local_source,
             filename=new_name,
-            caption=f"✅ `{escape_md(new_name)}`",
-            parse_mode="MarkdownV2",
+            caption=f"✅ {new_name}",
             read_timeout=READ_TIMEOUT,
             write_timeout=WRITE_TIMEOUT,
             connect_timeout=CONNECT_TIMEOUT,
@@ -208,8 +204,7 @@ async def process_file(
 
         await status.edit_text(
             "✅ Complete\n\n"
-            f"📎 `{escape_md(new_name)}`",
-            parse_mode="MarkdownV2",
+            f"📎 {new_name}"
         )
 
         return True
@@ -231,8 +226,7 @@ async def process_file(
 
         await update.message.reply_text(
             "❌ Error processing file.\n\n"
-            f"`{escape_md(error)}`",
-            parse_mode="MarkdownV2",
+            f"{error}"
         )
 
         return False
